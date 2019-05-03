@@ -66,17 +66,22 @@ def get_global_vars(mod):
     return d
 
 def write_nb(nb, nb_path, mode='w'):
-    try:
-        with open(nb_path, mode) as f: f.write(nbformat.writes(nb, version=4))
-    except Exception as e:
-        print(f'Could not output nb format. Dumping json instead.\nPath: {nb_path}\nException: {e}')
-        json.dump(nb, open(nb_path, mode), indent=1)
+    with open(nb_path, mode) as f: f.write(nbformat.writes(nbformat.from_dict(nb), version=4))
 
-def execute_nb(fname, metadata=None, save=True):
+class ExecuteShowDocPreprocessor(ExecutePreprocessor):
+    "An ExecutePreprocessor that only executes show_doc cells"
+    def preprocess_cell(self, cell, resources, index):
+        if 'source' in cell and cell.cell_type == "code":
+            if IMPORT_RE.search(cell['source']) or SHOW_DOC_RE.search(cell['source']):
+                return super().preprocess_cell(cell, resources, index)
+        return cell, resources
+
+def execute_nb(fname, metadata=None, save=True, show_doc_only=False):
     "Execute notebook `fname` with `metadata` for preprocessing."
     # Any module used in the notebook that isn't inside must be in the same directory as this script
     with open(fname) as f: nb = nbformat.read(f, as_version=4)
-    ep = ExecutePreprocessor(timeout=600, kernel_name='python3')
+    ep_class = ExecuteShowDocPreprocessor if show_doc_only else ExecutePreprocessor
+    ep = ep_class(timeout=600, kernel_name='python3')
     metadata = metadata or {}
     ep.preprocess(nb, metadata)
     if save:
@@ -90,7 +95,7 @@ def create_module_page(mod, dest_path, force=False):
     nb = get_empty_notebook()
     mod_name = mod.__name__
     strip_name = strip_fastai(mod_name)
-    init_cell = [get_md_cell(f'# {strip_name}'), get_md_cell('Type an introduction of the package here.')]
+    init_cell = [get_md_cell(f'## Title for {strip_name} (use plain english, not module name!)'), get_md_cell('Type an introduction of the package here.')]
     cells = [get_code_cell(f'from fastai.gen_doc.nbdoc import *\nfrom {mod_name} import * ', True)]
 
     gvar_map = get_global_vars(mod)
@@ -130,12 +135,13 @@ def read_nb(fname):
     "Read a notebook in `fname` and return its corresponding json"
     with open(fname,'r') as f: return nbformat.reads(f.read(), as_version=4)
 
+SHOW_DOC_RE = re.compile(r"show_doc\(([\w\.]*)")
 def read_nb_content(cells, mod_name):
     "Build a dictionary containing the position of the `cells`."
     doc_fns = {}
     for i, cell in enumerate(cells):
         if cell['cell_type'] == 'code':
-            for match in re.findall(r"show_doc\(([\w\.]*)", cell['source']):
+            for match in SHOW_DOC_RE.findall(cell['source']):
                 doc_fns[match] = i
     return doc_fns
 
@@ -292,8 +298,12 @@ def get_module_from_notebook(doc_path):
     "Find module given a source path. Assume it belongs to fastai directory"
     return f'fastai.{Path(doc_path).stem}'
 
-def update_notebooks(source_path, dest_path=None, update_html=True, update_nb=False,
-                     update_nb_links=True, do_execute=False, html_path=None):
+def check_nbconvert_version():
+    import nbconvert
+    assert nbconvert.version_info >= (5,4,0), "Please update nbconvert to >=5.4 for consistent .html output"
+
+def update_notebooks(source_path, dest_path=None, update_html=True, document_new_fns=False,
+                     update_nb_links=True, html_path=None, force=False):
     "`source_path` can be a directory or a file. Assume all modules reside in the fastai directory."
     from .convert2html import convert_nb
     source_path = Path(source_path)
@@ -303,17 +313,25 @@ def update_notebooks(source_path, dest_path=None, update_html=True, update_nb=Fa
         html_path = dest_path/'..'/'docs' if html_path is None else Path(html_path)
         doc_path = source_path
         assert source_path.suffix == '.ipynb', 'Must update from notebook or module'
-        if update_nb:
+        if document_new_fns:
             mod = import_mod(get_module_from_notebook(source_path))
             if not mod: print('Could not find module for path:', source_path)
             elif mod.__file__.endswith('__init__.py'): pass
             else: update_module_page(mod, dest_path)
-        if update_nb_links: link_nb(doc_path)
         generate_missing_metadata(doc_path)
-        if do_execute:
-            print(f'Executing notebook {doc_path}. Please wait...')
-            execute_nb(doc_path, {'metadata': {'path': doc_path.parent}})
-        if update_html: convert_nb(doc_path, html_path)
+        if update_nb_links:
+            print(f'Updating notebook {doc_path}. Please wait...')
+            link_nb(doc_path)
+            execute_nb(doc_path, {'metadata': {'path': doc_path.parent}}, show_doc_only=True)
+        if update_html:
+            check_nbconvert_version()
+            html_fn = html_path/doc_path.with_suffix('.html').name
+            if not force and html_fn.is_file():
+                in_mod  = os.path.getmtime(doc_path)
+                out_mod = os.path.getmtime(html_fn)
+                if in_mod < out_mod: return
+            convert_nb(doc_path, html_path)
+
     elif (source_path.name.startswith('fastai.')):
         # Do module update
         assert dest_path is not None, 'To update a module, you must specify a destination folder for where notebook resides'
@@ -323,8 +341,10 @@ def update_notebooks(source_path, dest_path=None, update_html=True, update_nb=Fa
         if not doc_path.exists():
             print('Notebook does not exist. Creating:', doc_path)
             create_module_page(mod, dest_path)
-        update_notebooks(doc_path, dest_path=dest_path, update_html=update_html, update_nb=False, update_nb_links=update_nb_links, do_execute=do_execute, html_path=html_path)
+        update_notebooks(doc_path, dest_path=dest_path, update_html=update_html, document_new_fns=document_new_fns,
+                         update_nb_links=update_nb_links, html_path=html_path)
     elif source_path.is_dir():
-        for f in Path(source_path).glob('*.ipynb'):
-            update_notebooks(f, dest_path=dest_path, update_html=update_html, update_nb=update_nb, update_nb_links=update_nb_links, do_execute=do_execute, html_path=html_path)
+        for f in sorted(Path(source_path).glob('*.ipynb')):
+            update_notebooks(f, dest_path=dest_path, update_html=update_html, document_new_fns=document_new_fns,
+                             update_nb_links=update_nb_links, html_path=html_path)
     else: print('Could not resolve source file:', source_path)
